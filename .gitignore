@@ -15,6 +15,7 @@ htmlcov/
 .venv/
 venv/
 env/
+.model_wheels/
 
 # Packaging output
 build/
@@ -46,3 +47,14 @@ generated/
 *.bak
 *.log
 startup_error.txt
+
+# Local calibration media (never commit user audio or Song Master stems)
+/*.flac
+/*.wav
+/*.mp3
+/*.m4a
+/*.ogg
+/*_Piano.mid
+/*_Piano.midi
+/*_Vocals.mid
+/*_Vocals.midi

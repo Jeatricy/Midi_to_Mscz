@@ -3,7 +3,18 @@
 from .midi_io import MidiReadError, parse_midi, read_midi_file, read_midi_files
 from .metadata import infer_score_metadata, key_name
 from .pipeline import convert
+from .audio_verify import (
+    AudioVerificationDependencyError,
+    AudioVerificationError,
+    get_backend_status,
+    verify_audio,
+)
 from .models import (
+    AudioAlignment,
+    AudioNoteEvidence,
+    AudioReviewItem,
+    AudioVerificationResult,
+    AudioVerificationSettings,
     AttackGroup,
     ChordEvent,
     ConversionReport,
@@ -24,9 +35,16 @@ from .models import (
     VoiceLine,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
+    "AudioAlignment",
+    "AudioNoteEvidence",
+    "AudioReviewItem",
+    "AudioVerificationDependencyError",
+    "AudioVerificationError",
+    "AudioVerificationResult",
+    "AudioVerificationSettings",
     "AttackGroup",
     "ChordEvent",
     "ConversionReport",
@@ -48,8 +66,10 @@ __all__ = [
     "VoiceLine",
     "parse_midi",
     "convert",
+    "get_backend_status",
     "infer_score_metadata",
     "key_name",
     "read_midi_file",
     "read_midi_files",
+    "verify_audio",
 ]

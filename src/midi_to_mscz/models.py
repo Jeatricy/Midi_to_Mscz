@@ -16,6 +16,12 @@ from typing import Literal, TypeAlias
 Staff = Literal["treble", "bass"]
 StaffAssignment = Literal["treble", "bass"]
 Sensitivity = Literal["strict", "normal", "aggressive"]
+AudioRole = Literal["auto", "vocals", "accompaniment", "mix"]
+AudioVerificationMode = Literal["conservative", "balanced", "strict"]
+AudioDecision = Literal["keep", "review", "remove"]
+AudioReviewKind = Literal[
+    "possible_extra", "possible_missing", "alignment", "model_disagreement"
+]
 QuantizationKind = Literal[
     "binary", "tuplet", "triplet", "arpeggio", "grace", "swing", "ornament", "free"
 ]
@@ -65,6 +71,7 @@ class InputSpec:
     velocity_min: int = 1
     offset_beats: Fraction | float = Fraction(0)
     transpose_semitones: int = 0
+    audio_role: AudioRole = "auto"
 
     def __post_init__(self) -> None:
         self.path = Path(self.path)
@@ -73,6 +80,11 @@ class InputSpec:
             raise ValueError("staff must be 'treble' or 'bass'")
         self.transpose_octaves = int(self.transpose_octaves)
         self.transpose_semitones = int(self.transpose_semitones)
+        self.audio_role = self.audio_role.lower().strip()  # type: ignore[assignment]
+        if self.audio_role not in {"auto", "vocals", "accompaniment", "mix"}:
+            raise ValueError(
+                "audio_role must be 'auto', 'vocals', 'accompaniment', or 'mix'"
+            )
         self.velocity_min = int(self.velocity_min)
         if not 0 <= self.velocity_min <= 127:
             raise ValueError("velocity_min must be between 0 and 127")
@@ -83,6 +95,57 @@ class InputSpec:
         """The complete pitch shift requested for this source."""
 
         return self.transpose_octaves * 12 + self.transpose_semitones
+
+
+@dataclass
+class AudioVerificationSettings:
+    """Local audio-to-MIDI verification options.
+
+    Basic Pitch is required unless ``dsp_only`` is explicitly selected.  This
+    is deliberate: silently falling back after a model import/inference error
+    could make a destructive cleanup look more trustworthy than it is.
+    """
+
+    audio_path: Path | str | None = None
+    enabled: bool = True
+    mode: AudioVerificationMode = "conservative"
+    dsp_only: bool = False
+    auto_remove: bool = True
+    source_separation: bool | Literal["auto"] = "auto"
+    sample_rate: int = 22_050
+    alignment_search_seconds: float = 30.0
+    onset_tolerance_seconds: float = 0.14
+    pitch_tolerance_semitones: int = 0
+    model_min_amplitude: float = 0.30
+    max_review_items: int = 500
+
+    def __post_init__(self) -> None:
+        if self.audio_path is not None:
+            self.audio_path = Path(self.audio_path)
+        if self.mode not in {"conservative", "balanced", "strict"}:
+            raise ValueError(
+                "audio verification mode must be conservative, balanced, or strict"
+            )
+        if self.source_separation not in {False, True, "auto"}:
+            raise ValueError("source_separation must be false, true, or 'auto'")
+        self.sample_rate = int(self.sample_rate)
+        if not 8_000 <= self.sample_rate <= 48_000:
+            raise ValueError("audio sample_rate must be between 8000 and 48000")
+        self.alignment_search_seconds = float(self.alignment_search_seconds)
+        if not 0 < self.alignment_search_seconds <= 300:
+            raise ValueError("alignment_search_seconds must be in (0, 300]")
+        self.onset_tolerance_seconds = float(self.onset_tolerance_seconds)
+        if not 0.02 <= self.onset_tolerance_seconds <= 1.0:
+            raise ValueError("onset_tolerance_seconds must be between 0.02 and 1")
+        self.pitch_tolerance_semitones = int(self.pitch_tolerance_semitones)
+        if not 0 <= self.pitch_tolerance_semitones <= 2:
+            raise ValueError("pitch_tolerance_semitones must be between 0 and 2")
+        self.model_min_amplitude = float(self.model_min_amplitude)
+        if not 0 <= self.model_min_amplitude <= 1:
+            raise ValueError("model_min_amplitude must be between 0 and 1")
+        self.max_review_items = int(self.max_review_items)
+        if self.max_review_items < 0:
+            raise ValueError("max_review_items cannot be negative")
 
 
 @dataclass
@@ -110,8 +173,13 @@ class ConversionSettings:
     pickup_beats: Fraction | float = Fraction(0)
     tempo_smoothing: bool = True
     auto_pickup: bool = True
+    audio_verification: AudioVerificationSettings | None = None
 
     def __post_init__(self) -> None:
+        if isinstance(self.audio_verification, dict):
+            self.audio_verification = AudioVerificationSettings(
+                **self.audio_verification
+            )
         if isinstance(self.bpm, str) and self.bpm.strip().lower() in {
             "",
             "auto",
@@ -339,6 +407,8 @@ class NoteEvent:
     grace_order: int = 0
     ornament: str | None = None
     confidence: float = 1.0
+    audio_confidence: float | None = None
+    audio_decision: AudioDecision | None = None
     tie_start: bool = False
     tie_stop: bool = False
 
@@ -525,6 +595,14 @@ class FileReport:
     grace_count: int = 0
     ornament_count: int = 0
     pedal_tails_trimmed: int = 0
+    audio_notes_checked: int = 0
+    audio_notes_removed: int = 0
+    audio_possible_extra: int = 0
+    audio_possible_missing: int = 0
+    audio_alignment_offset_seconds: float | None = None
+    audio_alignment_scale: float | None = None
+    audio_alignment_confidence: float | None = None
+    audio_source_separated: bool = False
     latency_bias_beats: Fraction = Fraction(0)
     warnings: list[str] = field(default_factory=list)
 
@@ -609,6 +687,92 @@ class MidiFileData:
         return self.key_signature_events
 
 
+@dataclass(frozen=True)
+class AudioAlignment:
+    """Affine mapping from a MIDI stem's seconds to the source audio."""
+
+    offset_seconds: float = 0.0
+    scale: float = 1.0
+    confidence: float = 0.0
+    matched_attacks: int = 0
+    total_attacks: int = 0
+    window_offsets_seconds: tuple[float, ...] = ()
+    max_window_residual_seconds: float = 0.0
+    ambiguous: bool = False
+
+    def map_seconds(self, midi_seconds: float) -> float:
+        return float(midi_seconds) * self.scale + self.offset_seconds
+
+
+@dataclass(frozen=True)
+class AudioNoteEvidence:
+    """Four independent evidence families for one supplied MIDI note."""
+
+    note_id: NoteId
+    source_index: int
+    source_path: Path | str
+    pitch: int
+    original_pitch: int
+    matched_audio_pitch: int
+    start_beat: Fraction | int | float
+    audio_start_seconds: float
+    audio_end_seconds: float
+    harmonic_support: float
+    onset_support: float
+    model_support: float | None
+    context_support: float
+    confidence: float
+    extra_probability: float
+    special_rhythm_guard: float
+    structural_risk: float
+    structural_reasons: tuple[str, ...]
+    decision: AudioDecision
+    reasons: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_path", Path(self.source_path))
+        object.__setattr__(self, "start_beat", as_fraction(self.start_beat))
+
+
+@dataclass(frozen=True)
+class AudioReviewItem:
+    """A location that should be checked in MuseScore after conversion."""
+
+    kind: AudioReviewKind
+    message: str
+    measure: int
+    source_index: int | None = None
+    source_path: Path | str | None = None
+    note_id: NoteId | None = None
+    pitch: int | None = None
+    original_pitch: int | None = None
+    start_beat: Fraction | int | float | None = None
+    audio_start_seconds: float | None = None
+    confidence: float = 0.0
+    evidence: AudioNoteEvidence | None = None
+
+    def __post_init__(self) -> None:
+        if self.source_path is not None:
+            object.__setattr__(self, "source_path", Path(self.source_path))
+        if self.start_beat is not None:
+            object.__setattr__(self, "start_beat", as_fraction(self.start_beat))
+
+
+@dataclass
+class AudioVerificationResult:
+    """Result of verification; ``files`` contain the conservatively filtered notes."""
+
+    files: list[MidiFileData]
+    alignment: AudioAlignment
+    evidence: list[AudioNoteEvidence] = field(default_factory=list)
+    review_items: list[AudioReviewItem] = field(default_factory=list)
+    removed_note_ids: list[NoteId] = field(default_factory=list)
+    model_name: str | None = None
+    dsp_only: bool = False
+    source_separated: bool = False
+    warnings: list[str] = field(default_factory=list)
+
+
 @dataclass
 class ConversionReport:
     """Aggregate report, extended by later conversion stages as they run."""
@@ -635,6 +799,18 @@ class ConversionReport:
     time_signature_change_count: int = 0
     key_change_count: int = 0
     pickup_beats: Fraction = Fraction(0)
+    audio_verification_enabled: bool = False
+    audio_model_name: str | None = None
+    audio_dsp_only: bool = False
+    audio_source_separated: bool = False
+    audio_alignment_offset_seconds: float | None = None
+    audio_alignment_scale: float | None = None
+    audio_alignment_confidence: float | None = None
+    audio_notes_checked: int = 0
+    audio_notes_removed: int = 0
+    audio_possible_extra: int = 0
+    audio_possible_missing: int = 0
+    audio_review_items: list[AudioReviewItem] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -702,6 +878,15 @@ class ConversionReport:
 __all__ = [
     "ArpeggioDirection",
     "AttackGroup",
+    "AudioAlignment",
+    "AudioDecision",
+    "AudioNoteEvidence",
+    "AudioReviewItem",
+    "AudioReviewKind",
+    "AudioRole",
+    "AudioVerificationMode",
+    "AudioVerificationResult",
+    "AudioVerificationSettings",
     "ChordEvent",
     "ConversionReport",
     "ConversionSettings",

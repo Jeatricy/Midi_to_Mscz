@@ -53,6 +53,41 @@
           <p>建议把人声放在高音谱表，把钢琴或低音声部放在低音谱表；之后仍可逐个调整。</p>
         </div>
         <div id="fileList" class="file-list" aria-live="polite"></div>
+
+        <div class="audio-review-card">
+          <div class="audio-review-head">
+            <div>
+              <p class="kicker">可选 · 原曲交叉检查</p>
+              <h3>用原始音频复核多余音与漏音 <button class="help-dot" type="button" data-help="audio-review" aria-label="解释原始音频复核">?</button></h3>
+              <p>频谱、起音证据和本地音乐模型会共同评分；只有高置信的多余音才会自动删除，其余位置只列入人工复核。</p>
+            </div>
+            <label class="switch-only" title="启用原始音频复核"><input id="audioReviewEnabled" type="checkbox"><i></i><span>启用</span></label>
+          </div>
+          <div id="audioReviewBody" class="audio-review-body" hidden>
+            <input id="audioInput" type="file" accept=".flac,.wav,.mp3,.ogg,audio/flac,audio/wav,audio/mpeg,audio/ogg" hidden>
+            <div class="audio-picker-row">
+              <button id="chooseAudio" class="audio-file-button" type="button">
+                <span class="wave-mark" aria-hidden="true">≋</span>
+                <span><strong id="audioFileName">选择一份原始音频</strong><small id="audioFileMeta">支持 FLAC / WAV / MP3 / OGG，最大 512 MB</small></span>
+                <i>选择</i>
+              </button>
+              <button id="removeAudio" class="round-button audio-remove" type="button" aria-label="移除原始音频" hidden>×</button>
+            </div>
+            <div class="audio-options">
+              <fieldset>
+                <legend>复核强度</legend>
+                <div class="segmented three-way">
+                  <label><input type="radio" name="audioReviewMode" value="conservative" checked><span>保守</span></label>
+                  <label><input type="radio" name="audioReviewMode" value="balanced"><span>普通</span></label>
+                  <label><input type="radio" name="audioReviewMode" value="strict"><span>严格</span></label>
+                </div>
+                <small id="audioModeHint">只自动删除多项证据都明确否定的音，最适合第一次使用。</small>
+              </fieldset>
+              <label class="toggle-row model-policy"><input id="audioRequireModel" type="checkbox" checked><span><b>使用本地音乐模型</b><small>默认同时使用模型与频谱；关闭后会明确改为仅频谱/起音判断，不会静默降级。</small></span><i></i></label>
+            </div>
+            <div id="audioModelStatus" class="model-status" role="status"><i></i><span><b>正在检查本地模型…</b><small>原始音频始终只在这台电脑上处理，不会发送到网络。</small></span></div>
+          </div>
+        </div>
       </section>
 
       <section class="step-section" aria-labelledby="scoreHeading">
@@ -221,6 +256,18 @@
           <p id="reviewMeasures"></p>
           <small>这些位置存在多种合理记法，程序已选择最可能的一种；请在 MuseScore 中听看对照。</small>
         </div>
+        <div id="audioResultBox" class="audio-result-box" hidden>
+          <b>原始音频复核</b>
+          <p id="audioResultSummary"></p>
+          <small id="audioResultDetails"></small>
+          <details id="audioReviewDetails" class="audio-review-details" hidden>
+            <summary><span><b>音频复核明细</b><small id="audioReviewCount"></small></span><i aria-hidden="true">＋</i></summary>
+            <div class="audio-review-detail-body">
+              <p>按可信度从高到低排列。拍位是从全曲第 0 拍开始计算的四分音符拍；请优先用小节号、音名和源文件在 MuseScore 中定位。</p>
+              <div id="audioReviewList" class="audio-review-list"></div>
+            </div>
+          </details>
+        </div>
         <div id="warningBox" class="warning-box" hidden></div>
       </div>
       <div class="result-actions">
@@ -246,6 +293,7 @@
       <article id="help-key"><h3>调号与“五度圈”</h3><p>调号写在每行开头，规定哪些音默认升高或降低。自动模式会比较 MIDI 调号标签与实际音符分布来选择开头调号；曲中换调只有在 MIDI 明确记录时才会保留，把握不足的位置会提示复核。“五度圈”是按纯五度排列各调的关系图，旧界面的 −7 到 +7 只是调号中降号或升号的数量；这里已换成实际调名。关系大调与小调共用同一组升降号。调号不会改变实际声音。</p></article>
       <article id="help-smallest"><h3>最小音符</h3><p>这是普通节奏吸附的基本精度。十六分音符适合多数流行歌；三十二分更贴近细节，但谱面可能更复杂。检测到的连音、琶音、倚音和装饰音会单独处理，不会简单压到网格上。</p></article>
       <article id="help-pickup"><h3>弱起拍</h3><p>有些旋律在第一个完整强拍之前就开始，开头那个不完整小节叫弱起小节。例如 4/4 歌曲只有最后一拍先唱起，弱起长度就是 1 个四分音符拍。拍号设为自动时，程序只会识别 MIDI 用“短的首个拍号段，随后进入完整拍号”明确编码的弱起，不会仅凭开头几个音可靠猜测。需要手动填写时，请先选择手动拍号；没有弱起填 0。</p></article>
+      <article id="help-audio-review"><h3>原始音频复核与可信度</h3><p>程序先对齐音频与 MIDI，再分别检查同音高的频谱能量、是否存在新的起音、是否可能只是别的音的泛音，以及本地音乐转录模型是否支持这个音。保守模式只删除证据非常充分的误判；普通和严格模式会逐步提高自动处理力度。滑音、琶音、倚音、连音和被伴奏遮盖的音容易产生歧义，因此低置信结果会保留并标出小节。安装 Demucs 时，“复核声源”会把人声与伴奏分开核对；未安装时会明确降级到完整混音。模型与频谱分析均在本机运行，不需要大模型 API，也不会上传歌曲。</p></article>
       <article><h3>人工复核小节</h3><p>自由速度、极密集装饰或多个节奏解释同样合理时，结果页会列出小节号。谱面仍会完整生成，你只需到 MuseScore 对照原曲检查这些位置。</p></article>
     </div>
   </aside>
@@ -266,6 +314,7 @@
         <label class="compact-field"><span>额外移调（半音） <button class="help-dot" type="button" data-help="semitone" aria-label="解释额外移调">?</button></span><input data-field="semitones" type="number" min="-11" max="11" value="0"></label>
         <label class="compact-field"><span>力度阈值（低于才删） <button class="help-dot" type="button" data-help="velocity" aria-label="解释力度阈值">?</button></span><input data-field="velocity" type="number" min="1" max="127" value="1"></label>
         <label class="compact-field"><span>时间对齐（四分音符拍） <button class="help-dot" type="button" data-help="offset" aria-label="解释时间对齐">?</button></span><input data-field="offset" type="number" min="-128" max="128" step="0.125" value="0"></label>
+        <label class="compact-field audio-role-field"><span>复核声源 <button class="help-dot" type="button" data-help="audio-review" aria-label="解释复核声源">?</button></span><select data-field="audio-role"><option value="auto" selected>按文件名自动判断</option><option value="vocals">人声</option><option value="accompaniment">钢琴 / 伴奏</option><option value="mix">完整混音</option></select></label>
       </div>
     </article>
   </template>

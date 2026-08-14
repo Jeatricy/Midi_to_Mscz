@@ -13,6 +13,9 @@ const state = {
   resultBlob: null,
   resultFileName: null,
   resultSaved: false,
+  audioFile: null,
+  audioUploadId: null,
+  audioCapabilities: null,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -50,6 +53,20 @@ const elements = {
   help: $("#helpDrawer"),
   scrim: $("#drawerScrim"),
   toast: $("#toastRegion"),
+  audioEnabled: $("#audioReviewEnabled"),
+  audioBody: $("#audioReviewBody"),
+  audioInput: $("#audioInput"),
+  chooseAudio: $("#chooseAudio"),
+  removeAudio: $("#removeAudio"),
+  audioFileName: $("#audioFileName"),
+  audioFileMeta: $("#audioFileMeta"),
+  audioModelStatus: $("#audioModelStatus"),
+  audioResultBox: $("#audioResultBox"),
+  audioResultSummary: $("#audioResultSummary"),
+  audioResultDetails: $("#audioResultDetails"),
+  audioReviewDetails: $("#audioReviewDetails"),
+  audioReviewCount: $("#audioReviewCount"),
+  audioReviewList: $("#audioReviewList"),
 };
 
 const FILE_SYSTEM_ERROR = "当前浏览器不支持直接保存到文件夹。请使用最新版 Microsoft Edge 或 Google Chrome 打开本地页面；本应用不会改用浏览器下载。";
@@ -214,6 +231,98 @@ function validMidiFile(file) {
   return suffix.endsWith(".mid") || suffix.endsWith(".midi");
 }
 
+function validAudioFile(file) {
+  return /\.(?:flac|wav|mp3|ogg)$/i.test(file.name);
+}
+
+function setAudioFile(file) {
+  if (file && !validAudioFile(file)) {
+    toast(`“${file.name}”不是支持的音频格式。`, "error");
+    elements.audioInput.value = "";
+    return;
+  }
+  if (file && file.size > 512 * 1024 * 1024) {
+    toast(`“${file.name}”超过 512 MB，无法添加。`, "error");
+    elements.audioInput.value = "";
+    return;
+  }
+  state.audioFile = file || null;
+  elements.audioFileName.textContent = file ? file.name : "选择一份原始音频";
+  elements.audioFileMeta.textContent = file
+    ? `${formatSize(file.size)} · 转换后随任务临时文件一起清理`
+    : "支持 FLAC / WAV / MP3 / OGG，最大 512 MB";
+  elements.removeAudio.hidden = !file;
+  elements.chooseAudio.classList.toggle("is-selected", Boolean(file));
+}
+
+function updateAudioReviewState() {
+  const enabled = elements.audioEnabled.checked;
+  elements.audioBody.hidden = !enabled;
+  if (enabled) window.setTimeout(() => elements.chooseAudio.focus(), 0);
+}
+
+function updateAudioModeHint() {
+  const mode = $('input[name="audioReviewMode"]:checked')?.value || "conservative";
+  const messages = {
+    conservative: "只自动删除多项证据都明确否定的音，最适合第一次使用。",
+    balanced: "在证据较一致时自动删除，仍会保留装饰音、遮盖音等歧义位置。",
+    strict: "更积极地清理疑似误判音；输出后应重点检查列出的复核小节。",
+  };
+  $("#audioModeHint").textContent = messages[mode];
+}
+
+async function loadAudioCapabilities() {
+  const status = elements.audioModelStatus;
+  try {
+    const payload = await apiFetch("/api/capabilities");
+    const info = payload?.audio_review || {};
+    state.audioCapabilities = info;
+    const modelAvailable = Boolean(
+      info.model_available ?? info.basic_pitch_available ?? info.model?.available
+    );
+    const separationAvailable = Boolean(
+      info.source_separation_available ?? info.demucs_available
+    );
+    const modelName = info.model_name || info.model?.name || "Spotify Basic Pitch";
+    status.classList.toggle("is-ready", modelAvailable);
+    status.classList.toggle("is-unavailable", !modelAvailable);
+    $("b", status).textContent = modelAvailable
+      ? `${modelName} 已可用`
+      : `${modelName} 当前不可用`;
+    const separationText = separationAvailable
+      ? "Demucs 已可用，会按每个 MIDI 的复核声源自动分离人声与伴奏。"
+      : "未安装 Demucs，复核声源会自动降级为完整混音，不影响模型与频谱复核。";
+    $("small", status).textContent = modelAvailable
+      ? `复核会使用本地模型、频谱与起音证据；${separationText} 音频不会发送到网络。`
+      : `保持“使用本地音乐模型”时转换会停止并说明安装问题；关闭后可改用频谱与起音证据。${separationText}`;
+  } catch (_) {
+    status.classList.add("is-unavailable");
+    $("b", status).textContent = "暂时无法读取模型状态";
+    $("small", status).textContent = "转换开始时会再次检查；所有分析仍只在本机进行。";
+  }
+}
+
+async function uploadReferenceAudio(file) {
+  elements.progressStage.textContent = "正在流式接收原始音频";
+  elements.progressLog.replaceChildren();
+  const response = await apiFetch("/api/audio-uploads", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "X-Audio-Name": encodeURIComponent(file.name),
+    },
+    body: file,
+  });
+  return response.upload_id;
+}
+
+async function discardPendingAudio(uploadId) {
+  if (!uploadId) return;
+  try {
+    await apiFetch(`/api/audio-uploads/${encodeURIComponent(uploadId)}/discard`, { method: "POST" });
+  } catch (_) { /* server shutdown also removes every pending upload */ }
+}
+
 function addFiles(fileList) {
   const candidates = [...fileList];
   let added = 0;
@@ -353,6 +462,7 @@ function collectConfiguration() {
       semitones: Number($('[data-field="semitones"]', card).value),
       velocity_min: Number($('[data-field="velocity"]', card).value),
       offset_beats: Number($('[data-field="offset"]', card).value),
+      audio_role: $('[data-field="audio-role"]', card)?.value || "auto",
     };
   });
   if (staffCounts.treble > 4 || staffCounts.bass > 4) {
@@ -368,11 +478,23 @@ function collectConfiguration() {
   const bpmMode = $('input[name="bpmMode"]:checked').value;
   const meterMode = $('input[name="meterMode"]:checked').value;
   const keyMode = $('input[name="keyMode"]:checked').value;
+  const audioEnabled = elements.audioEnabled.checked;
+  if (audioEnabled && !state.audioFile) {
+    elements.chooseAudio.focus();
+    throw new Error("已启用原始音频复核，请先选择一份原始音频。 ");
+  }
   const outputName = elements.outputName.value.trim() || "标准化乐谱.mscz";
   return {
     version: 1,
     output_name: outputName.toLowerCase().endsWith(".mscz") ? outputName : `${outputName}.mscz`,
     files,
+    audio_review: {
+      enabled: audioEnabled,
+      upload_id: null,
+      mode: $('input[name="audioReviewMode"]:checked')?.value || "conservative",
+      require_model: $("#audioRequireModel").checked,
+      dsp_only: !$("#audioRequireModel").checked,
+    },
     settings: {
       bpm_mode: bpmMode,
       bpm: bpmMode === "auto" ? null : numberValue("#bpm", "BPM", 20, 400),
@@ -442,6 +564,113 @@ function addStat(label, value) {
   elements.stats.append(chip);
 }
 
+function metricCount(value) {
+  if (Array.isArray(value)) return value.length;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function compactNumber(value, digits = 3) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  return numeric.toFixed(digits).replace(/\.?0+$/, "");
+}
+
+function audioClock(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = (seconds - minutes * 60).toFixed(3).padStart(6, "0");
+  return `${minutes}:${remainder}`;
+}
+
+function renderAudioReviewItems(result) {
+  const incoming = Array.isArray(result.audio_review_items) ? result.audio_review_items : [];
+  const items = [...incoming].sort((left, right) =>
+    metricCount(right?.confidence) - metricCount(left?.confidence)
+  );
+  elements.audioReviewList.replaceChildren();
+  elements.audioReviewDetails.hidden = items.length === 0;
+  elements.audioReviewDetails.open = false;
+  if (!items.length) return;
+
+  const total = Math.max(items.length, metricCount(result.audio_review_item_count));
+  elements.audioReviewCount.textContent = result.audio_review_items_truncated || total > items.length
+    ? `共 ${total} 条，显示可信度最高的前 ${items.length} 条`
+    : `共 ${items.length} 条，可展开逐项定位`;
+
+  const fragments = document.createDocumentFragment();
+  for (const item of items) {
+    const decision = ["remove", "missing", "review"].includes(item?.decision)
+      ? item.decision
+      : "review";
+    const status = {
+      remove: "已自动删除",
+      missing: "疑似漏音 · 未自动补写",
+      review: "已保留 · 待人工复核",
+    }[decision];
+    const article = document.createElement("article");
+    article.className = `audio-review-item decision-${decision}`;
+
+    const head = document.createElement("div");
+    head.className = "audio-review-item-head";
+    const identity = document.createElement("div");
+    const title = document.createElement("strong");
+    const pitchText = item?.pitch_name || (
+      Number.isFinite(Number(item?.pitch)) ? `MIDI ${Number(item.pitch)}` : "未确定音高"
+    );
+    title.textContent = pitchText;
+    const kind = document.createElement("small");
+    kind.textContent = item?.kind === "possible_missing" ? "原曲中检测到、MIDI 中没有"
+      : item?.kind === "possible_extra" ? "MIDI 中存在、原曲证据不足"
+      : "音频与 MIDI 的判断存在分歧";
+    identity.append(title, kind);
+    const badge = document.createElement("span");
+    badge.className = "audio-decision-badge";
+    badge.textContent = status;
+    head.append(identity, badge);
+
+    const meta = document.createElement("div");
+    meta.className = "audio-review-meta";
+    const metaValues = [];
+    if (item?.source) metaValues.push(`源文件：${item.source}`);
+    if (item?.measure != null) metaValues.push(`第 ${item.measure} 小节`);
+    const beat = compactNumber(item?.start_beat);
+    if (beat != null) metaValues.push(`全曲第 ${beat} 拍`);
+    const clock = audioClock(item?.audio_start);
+    if (clock != null) metaValues.push(`音频 ${clock}`);
+    if (Number.isFinite(Number(item?.pitch))) metaValues.push(`MIDI ${Number(item.pitch)}`);
+    if (
+      Number.isFinite(Number(item?.original_pitch)) &&
+      Number(item.original_pitch) !== Number(item?.pitch)
+    ) {
+      metaValues.push(`原始 ${item.original_pitch_name || `MIDI ${Number(item.original_pitch)}`}`);
+    }
+    for (const value of metaValues) {
+      const chip = document.createElement("span");
+      chip.textContent = value;
+      meta.append(chip);
+    }
+
+    const confidence = Math.max(0, Math.min(1, metricCount(item?.confidence)));
+    const confidenceRow = document.createElement("div");
+    confidenceRow.className = "audio-review-confidence";
+    const confidenceLabel = document.createElement("span");
+    confidenceLabel.textContent = `${decision === "missing" ? "漏音" : "可疑"}可信度 ${Math.round(confidence * 100)}%`;
+    const track = document.createElement("i");
+    const fill = document.createElement("b");
+    fill.style.width = `${Math.round(confidence * 100)}%`;
+    track.append(fill);
+    confidenceRow.append(confidenceLabel, track);
+
+    const message = document.createElement("p");
+    message.textContent = String(item?.message || "请对照原始音频复核这个位置。");
+    article.append(head, meta, confidenceRow, message);
+    fragments.append(article);
+  }
+  elements.audioReviewList.append(fragments);
+}
+
 function renderResult(job, saved, saveError = null) {
   const result = job.result || {};
   elements.progress.hidden = true;
@@ -457,6 +686,17 @@ function renderResult(job, saved, saveError = null) {
   addStat("连音", result.tuplet_count);
   addStat("琶音", result.arpeggio_count);
   addStat("倚音", result.grace_count);
+  const audioPerformed = Boolean(
+    result.audio_review_enabled || result.audio_model_name || result.audio_summary ||
+    metricCount(result.audio_auto_removed) || metricCount(result.audio_suspected_extra) ||
+    metricCount(result.audio_suspected_missing) || metricCount(result.audio_review_item_count) ||
+    (Array.isArray(result.audio_review_items) && result.audio_review_items.length)
+  );
+  if (audioPerformed) {
+    addStat("音频复核删除", metricCount(result.audio_auto_removed));
+    addStat("疑似多余", metricCount(result.audio_suspected_extra));
+    addStat("疑似漏音", metricCount(result.audio_suspected_missing));
+  }
   if (Number(result.tempo_bpm) > 0) addStat(" BPM", Number(result.tempo_bpm).toFixed(3).replace(/\.?0+$/, ""));
   if (Array.isArray(result.time_signature) && result.time_signature.length === 2) {
     addStat("识别拍号", `${result.time_signature[0]}/${result.time_signature[1]}`);
@@ -476,6 +716,33 @@ function renderResult(job, saved, saveError = null) {
   const review = Array.isArray(result.review_measures) ? result.review_measures : [];
   elements.reviewBox.hidden = review.length === 0;
   elements.reviewMeasures.textContent = review.length ? `第 ${review.join("、")} 小节` : "";
+  elements.audioResultBox.hidden = !audioPerformed;
+  if (audioPerformed) {
+    const modeName = {
+      conservative: "保守",
+      balanced: "普通",
+      strict: "严格",
+    }[result.audio_review_mode] || "已完成";
+    const removed = metricCount(result.audio_auto_removed);
+    const extra = metricCount(result.audio_suspected_extra);
+    const missing = metricCount(result.audio_suspected_missing);
+    elements.audioResultSummary.textContent = result.audio_summary ||
+      `${modeName}模式自动删除 ${removed} 个高置信多余音；仍有 ${extra} 个疑似多余音、${missing} 个疑似漏音需要参考。`;
+    const details = [];
+    if (result.audio_model_used) details.push(`模型：${result.audio_model_name || "本地音乐模型"}`);
+    else details.push("复核后端：频谱与起音分析（未使用音乐模型）");
+    if (result.audio_backend) details.push(`后端：${result.audio_backend}`);
+    if (result.audio_alignment_seconds != null && Number.isFinite(Number(result.audio_alignment_seconds))) {
+      details.push(`对齐偏移：${Number(result.audio_alignment_seconds).toFixed(3)} 秒`);
+    } else if (result.audio_alignment_beats != null && Number.isFinite(Number(result.audio_alignment_beats))) {
+      details.push(`对齐偏移：${Number(result.audio_alignment_beats).toFixed(3)} 拍`);
+    }
+    if (result.audio_alignment_confidence != null && Number.isFinite(Number(result.audio_alignment_confidence))) {
+      details.push(`对齐可信度：${Math.round(Number(result.audio_alignment_confidence) * 100)}%`);
+    }
+    elements.audioResultDetails.textContent = details.join(" · ");
+  }
+  renderAudioReviewItems(result);
   const warnings = Array.isArray(result.warnings) ? result.warnings.filter(Boolean) : [];
   elements.warningBox.hidden = warnings.length === 0;
   elements.warningBox.replaceChildren(...warnings.map(text => {
@@ -592,14 +859,24 @@ async function submitConversion(event) {
   state.resultFileName = null;
   state.resultSaved = false;
   showProgress();
-  const formData = new FormData();
-  formData.append("configuration", JSON.stringify(configuration));
-  for (const item of state.files) formData.append(item.id, item.file, item.file.name);
+  let audioUploadId = null;
   try {
+    if (configuration.audio_review.enabled) {
+      audioUploadId = await uploadReferenceAudio(state.audioFile);
+      state.audioUploadId = audioUploadId;
+      configuration.audio_review.upload_id = audioUploadId;
+    }
+    elements.progressStage.textContent = "正在安全接收 MIDI 与设置";
+    const formData = new FormData();
+    formData.append("configuration", JSON.stringify(configuration));
+    for (const item of state.files) formData.append(item.id, item.file, item.file.name);
     const response = await apiFetch("/api/jobs", { method: "POST", body: formData });
+    state.audioUploadId = null;
     state.jobId = response.job_id;
     await pollJob();
   } catch (error) {
+    await discardPendingAudio(audioUploadId || state.audioUploadId);
+    state.audioUploadId = null;
     elements.progress.hidden = true;
     elements.button.disabled = false;
     state.busy = false;
@@ -616,6 +893,19 @@ function bindEvents() {
     if (!event.target.closest("button")) elements.input.click();
   });
   elements.input.addEventListener("change", () => addFiles(elements.input.files));
+  elements.audioEnabled.addEventListener("change", updateAudioReviewState);
+  elements.chooseAudio.addEventListener("click", () => elements.audioInput.click());
+  elements.audioInput.addEventListener("change", () => {
+    const [file] = elements.audioInput.files || [];
+    if (file) setAudioFile(file);
+  });
+  elements.removeAudio.addEventListener("click", () => {
+    elements.audioInput.value = "";
+    setAudioFile(null);
+  });
+  $$('input[name="audioReviewMode"]').forEach(control => {
+    control.addEventListener("change", updateAudioModeHint);
+  });
   for (const name of ["dragenter", "dragover"]) {
     elements.drop.addEventListener(name, event => {
       event.preventDefault();
@@ -699,6 +989,9 @@ function bindEvents() {
 bindEvents();
 updateFileState();
 updateDirectoryDisplay();
+updateAudioReviewState();
+updateAudioModeHint();
+loadAudioCapabilities();
 if (!supportsDirectorySaving()) {
   elements.compatibilityError.hidden = false;
   elements.chooseDirectory.disabled = true;

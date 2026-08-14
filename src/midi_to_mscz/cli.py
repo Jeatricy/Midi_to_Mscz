@@ -99,6 +99,7 @@ _INPUT_ALIASES: Mapping[str, tuple[str, ...]] = {
         "manual_offset_beats",
         "timing_offset_beats",
     ),
+    "audio_role": ("audio_role", "review_source", "source_role"),
 }
 
 
@@ -238,6 +239,7 @@ def make_input_spec(
     transpose_semitones: int = 0,
     velocity_min: int = 1,
     offset_beats: float = 0.0,
+    audio_role: str = "auto",
     model: type[Any] | None = None,
 ) -> Any:
     """Create an InputSpec after validating all user-editable values."""
@@ -252,6 +254,9 @@ def make_input_spec(
         raise UserInputError("半音移调必须在 -11 到 11 之间。")
     if not 1 <= int(velocity_min) <= 127:
         raise UserInputError("最低力度必须在 1 到 127 之间。")
+    role = str(audio_role).strip().lower()
+    if role not in {"auto", "vocals", "accompaniment", "mix"}:
+        raise UserInputError("复核声源必须是 auto、vocals、accompaniment 或 mix。")
     if model is None:
         _, model, _ = _load_backend()
     return _construct_model(
@@ -263,6 +268,7 @@ def make_input_spec(
             "transpose_semitones": int(transpose_semitones),
             "velocity_min": int(velocity_min),
             "offset_beats": float(offset_beats),
+            "audio_role": role,
         },
         _INPUT_ALIASES,
     )
@@ -363,12 +369,12 @@ def _parse_bpm(value: str) -> float | None:
 
 
 def _parse_detailed_input(token: str, defaults: argparse.Namespace) -> dict[str, Any]:
-    """Parse PATH|STAFF|OCTAVES|SEMITONES|VELOCITY|OFFSET."""
+    """Parse PATH|STAFF|OCTAVES|SEMITONES|VELOCITY|OFFSET|AUDIO_ROLE."""
 
     fields = token.split("|")
-    if not fields[0].strip() or len(fields) > 6:
+    if not fields[0].strip() or len(fields) > 7:
         raise UserInputError(
-            "--input 格式为 PATH|STAFF|OCTAVES|SEMITONES|VELOCITY|OFFSET。"
+            "--input 格式为 PATH|STAFF|OCTAVES|SEMITONES|VELOCITY|OFFSET|AUDIO_ROLE。"
         )
     converters: tuple[Callable[[str], Any], ...] = (
         str,
@@ -377,6 +383,7 @@ def _parse_detailed_input(token: str, defaults: argparse.Namespace) -> dict[str,
         int,
         int,
         float,
+        str,
     )
     fallback = (
         "",
@@ -385,6 +392,7 @@ def _parse_detailed_input(token: str, defaults: argparse.Namespace) -> dict[str,
         defaults.transpose_semitones,
         defaults.velocity_min,
         defaults.offset_beats,
+        defaults.audio_role,
     )
     parsed: list[Any] = []
     for index, converter in enumerate(converters):
@@ -400,6 +408,7 @@ def _parse_detailed_input(token: str, defaults: argparse.Namespace) -> dict[str,
         transpose_semitones=parsed[3],
         velocity_min=parsed[4],
         offset_beats=parsed[5],
+        audio_role=parsed[6],
     )
 
 
@@ -420,7 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  midi-to-mscz --treble vocal.mid --bass piano.mid -o score.mscz\n"
             "  midi-to-mscz --input \"vocal.mid|treble|1|0|18|0\" "
             "--input \"piano.mid|bass|-1|0|12|0.25\" -o score.mscz\n\n"
-            "--input 各项依次为：路径|谱表|八度|半音|最低力度|偏移拍；后五项可省略。"
+            "--input 各项依次为：路径|谱表|八度|半音|最低力度|偏移拍|复核声源；后六项可省略。"
         ),
     )
     parser.add_argument("paths", nargs="*", metavar="MIDI", help="输入 MIDI（默认放入高音谱表）")
@@ -435,6 +444,36 @@ def build_parser() -> argparse.ArgumentParser:
     inputs.add_argument("--transpose-semitones", type=int, default=0, metavar="N", help="额外半音移调，-11..11")
     inputs.add_argument("--velocity-min", type=int, default=1, metavar="N", help="删除力度低于此值的音，1..127")
     inputs.add_argument("--offset-beats", type=float, default=0.0, metavar="BEATS", help="整体拍偏移，可为小数或负数")
+    inputs.add_argument(
+        "--audio-role",
+        choices=("auto", "vocals", "accompaniment", "mix"),
+        default="auto",
+        help="原始音频复核时，此 MIDI 对应自动判断/人声/伴奏/完整混音",
+    )
+
+    audio = parser.add_argument_group("原始音频复核（完全在本机运行）")
+    audio.add_argument(
+        "--reference-audio",
+        metavar="AUDIO",
+        help="用于复核 MIDI 误判的 FLAC/WAV/MP3/OGG 原始音频",
+    )
+    audio.add_argument(
+        "--audio-review-mode",
+        choices=("conservative", "balanced", "strict"),
+        default="conservative",
+        help="自动删除强度：conservative 保守、balanced 普通、strict 严格",
+    )
+    audio.add_argument(
+        "--audio-require-model",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="使用本地音乐模型；关闭后明确改用仅频谱/起音复核，默认开启",
+    )
+    audio.add_argument(
+        "--audio-dsp-only",
+        action="store_true",
+        help="仅用频谱/起音可信度复核，不加载音乐模型",
+    )
 
     score = parser.add_argument_group("全局记谱设置")
     score.add_argument("--bpm", default="auto", metavar="AUTO|N", help="速度；auto 表示自动读取/估算")
@@ -461,6 +500,7 @@ def _input_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
         transpose_semitones=args.transpose_semitones,
         velocity_min=args.velocity_min,
         offset_beats=args.offset_beats,
+        audio_role=args.audio_role,
     )
     rows = [dict(path=path, staff=args.default_staff, **common) for path in args.paths]
     rows.extend(dict(path=path, staff="treble", **common) for path in args.treble)
@@ -512,6 +552,10 @@ def format_report(report: Any) -> str:
         "out_of_midi_range",
         "out_of_piano_range",
         "pedal_tails_trimmed",
+        "audio_auto_removed",
+        "audio_suspected_extra",
+        "audio_suspected_missing",
+        "audio_review_mode",
     ):
         if attribute not in data and hasattr(report, attribute):
             data[attribute] = getattr(report, attribute)
@@ -553,6 +597,25 @@ def format_report(report: Any) -> str:
         "key_change_count": "调号变化",
         "pickup_beats": "弱起长度（四分音符拍）",
         "triplet_count": "识别三连音",
+        "audio_review_mode": "音频复核模式",
+        "audio_verification_enabled": "已执行原始音频复核",
+        "audio_notes_checked": "音频复核音符",
+        "audio_auto_removed": "音频复核自动删除",
+        "audio_notes_removed": "音频复核自动删除",
+        "audio_suspected_extra": "仍疑似多余音",
+        "audio_possible_extra": "仍疑似多余音",
+        "audio_suspected_missing": "疑似漏音",
+        "audio_possible_missing": "疑似漏音",
+        "audio_review_measures": "音频复核小节",
+        "audio_model_name": "本地复核模型",
+        "audio_model_used": "已使用音乐模型",
+        "audio_backend": "音频复核后端",
+        "audio_alignment_seconds": "音频对齐偏移（秒）",
+        "audio_alignment_offset_seconds": "音频对齐偏移（秒）",
+        "audio_alignment_scale": "音频时间伸缩比例",
+        "audio_alignment_beats": "音频对齐偏移（拍）",
+        "audio_alignment_confidence": "音频对齐可信度",
+        "audio_summary": "音频复核摘要",
         "warnings": "提示",
     }
     lines: list[str] = []
@@ -609,11 +672,30 @@ def run_conversion(args: argparse.Namespace) -> Any:
         model=settings_model,
     )
 
+    reference_audio: Path | None = None
+    if args.reference_audio:
+        reference_audio = Path(args.reference_audio).expanduser().resolve()
+        if not reference_audio.is_file():
+            raise UserInputError(f"找不到原始音频：{reference_audio}")
+        if reference_audio.suffix.lower() not in {".flac", ".wav", ".mp3", ".ogg"}:
+            raise UserInputError("原始音频仅支持 FLAC、WAV、MP3 或 OGG。")
+        if reference_audio.stat().st_size > 512 * 1024 * 1024:
+            raise UserInputError("原始音频超过 512 MB。")
+
     def progress(message: str) -> None:
         if not args.quiet:
             print(f"[转换] {message}", file=sys.stderr, flush=True)
 
-    return convert(specs, output, settings, progress)
+    return convert(
+        specs,
+        output,
+        settings,
+        progress,
+        reference_audio=reference_audio,
+        audio_review_mode=args.audio_review_mode if reference_audio else "off",
+        audio_require_model=bool(args.audio_require_model and not args.audio_dsp_only),
+        audio_dsp_only=bool(args.audio_dsp_only),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
