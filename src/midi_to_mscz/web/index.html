@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#18231f">
+  <title>谱净 · MIDI 标准化</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body data-token="__APP_TOKEN__">
+  <div class="paper-grain" aria-hidden="true"></div>
+  <header class="topbar">
+    <a class="brand" href="#main" aria-label="谱净首页">
+      <span class="brand-mark" aria-hidden="true">♩</span>
+      <span><strong>谱净</strong><small>MIDI → MuseScore</small></span>
+    </a>
+    <div class="top-actions">
+      <span class="local-pill"><i></i>仅在本机运行</span>
+      <button class="ghost-button" id="openHelp" type="button">名词解释</button>
+      <button class="exit-button" id="exitApp" type="button" title="停止本地服务">退出</button>
+    </div>
+  </header>
+
+  <main id="main" class="shell">
+    <section class="hero" aria-label="功能简介">
+      <p class="hero-copy">加入人声、钢琴或其他扒谱 MIDI，分别安排到高低音谱表。程序会整理踏板重叠、演奏误差和特殊节奏，交付可继续编辑的钢琴谱。</p>
+    </section>
+
+    <form id="convertForm" novalidate>
+      <section class="step-section" aria-labelledby="filesHeading">
+        <div class="section-head">
+          <div class="step-number">01</div>
+          <div>
+            <p class="kicker">输入声部</p>
+            <h2 id="filesHeading">添加并安排 MIDI</h2>
+          </div>
+          <p class="section-note">一个文件视为一个独立声部；同一谱表最多四个。</p>
+        </div>
+
+        <div class="drop-zone" id="dropZone">
+          <input id="fileInput" type="file" accept=".mid,.midi,audio/midi,audio/x-midi" multiple hidden>
+          <span class="drop-note" aria-hidden="true">♪</span>
+          <div>
+            <strong>把 MIDI 文件拖到这里</strong>
+            <span id="dropHint">或点击选择，可一次添加多个 .mid / .midi 文件</span>
+          </div>
+          <button class="secondary-button" id="chooseFiles" type="button" aria-describedby="dropHint">选择 MIDI</button>
+        </div>
+
+        <div id="emptyFiles" class="empty-files">
+          <span>还没有文件</span>
+          <p>建议把人声放在高音谱表，把钢琴或低音声部放在低音谱表；之后仍可逐个调整。</p>
+        </div>
+        <div id="fileList" class="file-list" aria-live="polite"></div>
+      </section>
+
+      <section class="step-section" aria-labelledby="scoreHeading">
+        <div class="section-head">
+          <div class="step-number">02</div>
+          <div>
+            <p class="kicker">乐谱结构</p>
+            <h2 id="scoreHeading">速度、拍号与调号</h2>
+          </div>
+          <p class="section-note">不确定时保持“自动”：速度和拍号读取 MIDI 事件，调号会结合标签与实际音符分析。</p>
+        </div>
+
+        <div class="settings-grid">
+          <fieldset class="setting-card accent-green">
+            <legend>BPM · 速度 <button class="help-dot" type="button" data-help="bpm" aria-label="解释 BPM">?</button></legend>
+            <p>每分钟走多少拍。自动模式读取 MIDI 速度事件并保留曲中的速度变化。</p>
+            <div class="segmented" data-mode-group="bpm">
+              <label><input type="radio" name="bpmMode" value="auto" checked><span>自动读取</span></label>
+              <label><input type="radio" name="bpmMode" value="manual"><span>手动指定</span></label>
+            </div>
+            <label class="field manual-field is-disabled" id="bpmField">
+              <span>固定 BPM</span>
+              <input id="bpm" type="number" value="120" min="20" max="400" step="0.1" disabled>
+            </label>
+          </fieldset>
+
+          <fieldset class="setting-card accent-amber">
+            <legend>拍号 <button class="help-dot" type="button" data-help="meter" aria-label="解释拍号">?</button></legend>
+            <p>例如 4/4 表示每小节四拍。自动模式读取 MIDI 拍号事件；没有事件时按 4/4 输出并提示复核。</p>
+            <div class="segmented" data-mode-group="meter">
+              <label><input type="radio" name="meterMode" value="auto" checked><span>自动读取</span></label>
+              <label><input type="radio" name="meterMode" value="manual"><span>手动指定</span></label>
+            </div>
+            <label class="field manual-field is-disabled" id="meterField">
+              <span>全曲拍号</span>
+              <select id="timeSignature" disabled>
+                <option>4/4</option><option>3/4</option><option>2/4</option>
+                <option>6/8</option><option>9/8</option><option>12/8</option>
+                <option>5/4</option><option>7/8</option>
+              </select>
+            </label>
+          </fieldset>
+
+          <fieldset class="setting-card accent-coral">
+            <legend>调号 <button class="help-dot" type="button" data-help="key" aria-label="解释调号">?</button></legend>
+            <p>告诉谱面哪些音默认升降。自动模式会比较 MIDI 调号标签和实际音符分布。</p>
+            <div class="segmented" data-mode-group="key">
+              <label><input type="radio" name="keyMode" value="auto" checked><span>自动分析</span></label>
+              <label><input type="radio" name="keyMode" value="manual"><span>手动指定</span></label>
+            </div>
+            <label class="field manual-field is-disabled" id="keyField">
+              <span>大调 / 关系小调</span>
+              <select id="keyFifths" disabled>
+                <option value="-7">C♭ 大调 / a♭ 小调 · 7 个降号</option>
+                <option value="-6">G♭ 大调 / e♭ 小调 · 6 个降号</option>
+                <option value="-5">D♭ 大调 / b♭ 小调 · 5 个降号</option>
+                <option value="-4">A♭ 大调 / f 小调 · 4 个降号</option>
+                <option value="-3">E♭ 大调 / c 小调 · 3 个降号</option>
+                <option value="-2">B♭ 大调 / g 小调 · 2 个降号</option>
+                <option value="-1">F 大调 / d 小调 · 1 个降号</option>
+                <option value="0" selected>C 大调 / a 小调 · 无升降号</option>
+                <option value="1">G 大调 / e 小调 · 1 个升号</option>
+                <option value="2">D 大调 / b 小调 · 2 个升号</option>
+                <option value="3">A 大调 / f♯ 小调 · 3 个升号</option>
+                <option value="4">E 大调 / c♯ 小调 · 4 个升号</option>
+                <option value="5">B 大调 / g♯ 小调 · 5 个升号</option>
+                <option value="6">F♯ 大调 / d♯ 小调 · 6 个升号</option>
+                <option value="7">C♯ 大调 / a♯ 小调 · 7 个升号</option>
+              </select>
+            </label>
+          </fieldset>
+        </div>
+
+        <details class="advanced-panel">
+          <summary><span><b>记谱精细设置</b><small>弱起拍、最小音符、特殊节奏识别</small></span><i aria-hidden="true">＋</i></summary>
+          <div class="advanced-content">
+            <div class="field-grid">
+              <label class="field">
+                <span>最小音符 <button class="help-dot" type="button" data-help="smallest" aria-label="解释最小音符">?</button></span>
+                <select id="smallestNote">
+                  <option value="8">八分音符 · 更简洁</option>
+                  <option value="16" selected>十六分音符 · 推荐</option>
+                  <option value="32">三十二分音符 · 更精细</option>
+                </select>
+                <small>普通音符量化的基础精度；连音和倚音不受这条网格硬压。</small>
+              </label>
+              <label class="field">
+                <span>弱起拍长度（四分音符拍） <button class="help-dot" type="button" data-help="pickup" aria-label="解释弱起拍">?</button></span>
+                <input id="pickupBeats" type="number" value="0" min="0" max="32" step="0.25" disabled aria-describedby="pickupHint">
+                <small id="pickupHint">自动拍号时会读取 MIDI 明确记录的短首小节；如需手填，请先选择“手动指定”拍号。</small>
+              </label>
+              <label class="field">
+                <span>标题</span>
+                <input id="title" type="text" maxlength="160" placeholder="可不填">
+              </label>
+              <label class="field">
+                <span>作曲 / 编配</span>
+                <input id="composer" type="text" maxlength="160" placeholder="可不填">
+              </label>
+            </div>
+
+            <div class="toggle-grid">
+              <label class="toggle-row"><input id="autoLatency" type="checkbox" checked><span><b>自动校正统一延迟</b><small>估计录音或扒谱造成的整体晚一点，并把声部移回拍点。</small></span><i></i></label>
+              <label class="toggle-row"><input id="autoTrim" type="checkbox" checked><span><b>裁去共同前导空白</b><small>所有文件开头都有同样一段空白时，从真正开始的位置记谱。</small></span><i></i></label>
+              <label class="toggle-row"><input id="detectArpeggios" type="checkbox" checked><span><b>保留琶音</b><small>依次滚奏的和弦不会被误压成完全同时发声。</small></span><i></i></label>
+              <label class="toggle-row"><input id="detectTuplets" type="checkbox" checked><span><b>识别各种连音</b><small>包括三、五、七、九连音等非二进制节奏。</small></span><i></i></label>
+              <label class="toggle-row"><input id="detectGrace" type="checkbox" checked><span><b>识别倚音</b><small>主音前很短的装饰音保留为倚音，不抢走主拍。</small></span><i></i></label>
+              <label class="toggle-row"><input id="detectSwing" type="checkbox" checked><span><b>识别 Swing / Shuffle</b><small>长短交替的摇摆八分音符不会被拉回平均八分。</small></span><i></i></label>
+              <label class="toggle-row"><input id="detectOrnaments" type="checkbox" checked><span><b>保护快速装饰音</b><small>颤音、波音等密集音型不会被当成误判全部合并。</small></span><i></i></label>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section class="step-section output-section" aria-labelledby="outputHeading">
+        <div class="section-head compact-head">
+          <div class="step-number">03</div>
+          <div>
+            <p class="kicker">保存</p>
+            <h2 id="outputHeading">选择文件夹并生成乐谱</h2>
+          </div>
+        </div>
+        <div class="output-row">
+          <label class="field output-name">
+            <span>保存文件名</span>
+            <input id="outputName" type="text" value="标准化乐谱.mscz" maxlength="105">
+          </label>
+          <div class="save-location">
+            <span class="field-label">保存文件夹</span>
+            <button class="directory-button" id="chooseDirectory" type="button" aria-describedby="directoryHint">
+              <span class="folder-mark" aria-hidden="true">▰</span>
+              <span><strong id="directoryName">尚未选择文件夹</strong><small id="directoryHint">点击后由浏览器请求写入权限</small></span>
+              <i aria-hidden="true">选择</i>
+            </button>
+          </div>
+          <button class="primary-button" id="convertButton" type="submit"><span>开始整理乐谱</span><i aria-hidden="true">→</i></button>
+        </div>
+        <div id="browserSupportError" class="compatibility-error" role="alert" hidden>
+          当前浏览器不支持直接保存到文件夹。请使用最新版 Microsoft Edge 或 Google Chrome 打开本地页面；本应用不会改用浏览器下载。
+        </div>
+        <div class="privacy-note output-privacy"><span aria-hidden="true">●</span><p><b>文件不会上传到互联网</b><small>全部分析在这台电脑上完成；转换成功后直接写入你授权的文件夹，同名文件会被替换。</small></p></div>
+      </section>
+    </form>
+
+    <section id="progressPanel" class="progress-panel" hidden aria-live="polite">
+      <div class="progress-orbit" aria-hidden="true"><span>♪</span></div>
+      <div class="progress-copy">
+        <p class="kicker">正在处理</p>
+        <h2 id="progressStage">准备转换</h2>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="progressBar"></i></div>
+        <div class="progress-meta"><span id="progressPercent">0%</span><span>请保持此页面打开</span></div>
+        <ol id="progressLog" class="progress-log"></ol>
+      </div>
+    </section>
+
+    <section id="resultPanel" class="result-panel" hidden aria-live="polite">
+      <div class="result-icon" aria-hidden="true">✓</div>
+      <div class="result-main">
+        <p class="kicker">转换完成</p>
+        <h2 id="resultTitle">乐谱已经保存</h2>
+        <p id="resultSummary">MSCZ 已写入所选文件夹，可以在 MuseScore 中继续编辑。</p>
+        <p id="savedLocation" class="saved-location"></p>
+        <div id="resultStats" class="stats-row"></div>
+        <div id="reviewBox" class="review-box" hidden>
+          <b>建议人工复核的小节</b>
+          <p id="reviewMeasures"></p>
+          <small>这些位置存在多种合理记法，程序已选择最可能的一种；请在 MuseScore 中听看对照。</small>
+        </div>
+        <div id="warningBox" class="warning-box" hidden></div>
+      </div>
+      <div class="result-actions">
+        <button id="reselectDirectory" class="secondary-button" type="button">重新选择保存目录</button>
+        <button id="newConversion" class="primary-button" type="button"><span>打开新转换</span><i aria-hidden="true">→</i></button>
+      </div>
+    </section>
+  </main>
+
+  <aside id="helpDrawer" class="help-drawer" role="dialog" aria-modal="true" aria-labelledby="helpTitle" aria-hidden="true" inert>
+    <div class="drawer-head">
+      <div><p class="kicker">使用词典</p><h2 id="helpTitle">名词解释</h2></div>
+      <button id="closeHelp" class="round-button" type="button" aria-label="关闭解释">×</button>
+    </div>
+    <div class="drawer-body">
+      <article id="help-staff"><h3>高音 / 低音谱表</h3><p>钢琴大谱表的上下两行。人声、旋律和较高音域通常放上面的高音谱表；左手、贝斯和较低音域通常放下面的低音谱表。同一谱表中的多个 MIDI 会成为彼此独立的声部。</p></article>
+      <article id="help-octave"><h3>八度调整</h3><p>把整个 MIDI 上移或下移八度，音名不变但音区改变。+1 表示升高 12 个半音，−1 表示降低 12 个半音。适合修正扒谱软件把人声识别到错误音区的情况。</p></article>
+      <article id="help-semitone"><h3>额外移调（半音）</h3><p>半音是钢琴上相邻两个琴键的距离。+2 会把整个文件升高两个琴键，−2 会降低两个琴键，因此实际声音也会改变。如果音高本来正确、只是谱面升降号太多，应改“调号”，不要用额外移调。</p></article>
+      <article id="help-velocity"><h3>力度阈值</h3><p>MIDI 力度范围通常是 1–127，代表一次按键有多强。只有低于阈值的音才会删除，等于阈值的音会保留。默认值 1 不会删除任何正常 MIDI 音；需要过滤误判弱音时再逐步调高，数值过高可能删掉真实弱音。</p></article>
+      <article id="help-offset"><h3>时间对齐（四分音符拍）</h3><p>把某一个完整 MIDI 在时间线上前后移动。这里 1 拍固定指一个四分音符长度；+1 表示晚一个四分音符拍，−0.5 表示提前半个四分音符拍。只有多个文件彼此没有对齐时才需要调整，通常保持 0。</p></article>
+      <article id="help-bpm"><h3>BPM · 速度</h3><p>BPM 是“每分钟拍数”。120 BPM 表示一分钟 120 个四分音符拍。自动模式读取 MIDI 内的速度事件，整理细碎抖动，并保留有意义的中途变速；它不会仅凭音符表演重新猜速度。若文件没有速度事件，暂按 120 BPM 输出并提示复核。手动模式会用一个固定速度覆盖全曲。</p></article>
+      <article id="help-meter"><h3>拍号与临时变拍</h3><p>拍号上面的数字表示每小节有几拍，下面的数字表示哪种音符算一拍，例如 6/8 是每小节六个八分音符。自动模式读取 MIDI 中明确记录的拍号事件，并保留其中的临时变拍；目前不会只凭音符节奏可靠猜拍号。若没有拍号事件，会按 4/4 输出；若扒谱软件只写了开头一个拍号，程序会保留它并提醒你复核段落转折，避免凭空编造变化位置。</p></article>
+      <article id="help-key"><h3>调号与“五度圈”</h3><p>调号写在每行开头，规定哪些音默认升高或降低。自动模式会比较 MIDI 调号标签与实际音符分布来选择开头调号；曲中换调只有在 MIDI 明确记录时才会保留，把握不足的位置会提示复核。“五度圈”是按纯五度排列各调的关系图，旧界面的 −7 到 +7 只是调号中降号或升号的数量；这里已换成实际调名。关系大调与小调共用同一组升降号。调号不会改变实际声音。</p></article>
+      <article id="help-smallest"><h3>最小音符</h3><p>这是普通节奏吸附的基本精度。十六分音符适合多数流行歌；三十二分更贴近细节，但谱面可能更复杂。检测到的连音、琶音、倚音和装饰音会单独处理，不会简单压到网格上。</p></article>
+      <article id="help-pickup"><h3>弱起拍</h3><p>有些旋律在第一个完整强拍之前就开始，开头那个不完整小节叫弱起小节。例如 4/4 歌曲只有最后一拍先唱起，弱起长度就是 1 个四分音符拍。拍号设为自动时，程序只会识别 MIDI 用“短的首个拍号段，随后进入完整拍号”明确编码的弱起，不会仅凭开头几个音可靠猜测。需要手动填写时，请先选择手动拍号；没有弱起填 0。</p></article>
+      <article><h3>人工复核小节</h3><p>自由速度、极密集装饰或多个节奏解释同样合理时，结果页会列出小节号。谱面仍会完整生成，你只需到 MuseScore 对照原曲检查这些位置。</p></article>
+    </div>
+  </aside>
+  <div id="drawerScrim" class="drawer-scrim" hidden></div>
+
+  <div id="toastRegion" class="toast-region" role="status" aria-live="polite"></div>
+
+  <template id="fileTemplate">
+    <article class="file-card">
+      <div class="file-identity">
+        <div class="midi-badge">MID</div>
+        <div class="file-name-wrap"><strong class="file-name"></strong><small class="file-size"></small></div>
+        <button class="remove-file" type="button" aria-label="移除文件">×</button>
+      </div>
+      <div class="file-controls">
+        <label class="compact-field staff-field"><span>放到哪个谱表 <button class="help-dot" type="button" data-help="staff" aria-label="解释谱表">?</button></span><select data-field="staff"><option value="treble">高音谱表</option><option value="bass">低音谱表</option></select></label>
+        <label class="compact-field"><span>八度 <button class="help-dot" type="button" data-help="octave" aria-label="解释八度调整">?</button></span><select data-field="octaves"><option value="-3">−3</option><option value="-2">−2</option><option value="-1">−1</option><option value="0" selected>不变</option><option value="1">+1</option><option value="2">+2</option><option value="3">+3</option></select></label>
+        <label class="compact-field"><span>额外移调（半音） <button class="help-dot" type="button" data-help="semitone" aria-label="解释额外移调">?</button></span><input data-field="semitones" type="number" min="-11" max="11" value="0"></label>
+        <label class="compact-field"><span>力度阈值（低于才删） <button class="help-dot" type="button" data-help="velocity" aria-label="解释力度阈值">?</button></span><input data-field="velocity" type="number" min="1" max="127" value="1"></label>
+        <label class="compact-field"><span>时间对齐（四分音符拍） <button class="help-dot" type="button" data-help="offset" aria-label="解释时间对齐">?</button></span><input data-field="offset" type="number" min="-128" max="128" step="0.125" value="0"></label>
+      </div>
+    </article>
+  </template>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

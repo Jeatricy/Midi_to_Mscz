@@ -1,0 +1,48 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging output
+build/
+dist/
+*.egg-info/
+*.egg
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Converter work directories and generated outputs
+midi-to-mscz-work-*/
+midi-to-mscz-*/
+output/
+outputs/
+generated/
+*.musicxml
+*_标准化.mscz
+*_normalized.mscz
+*_normalised.mscz
+
+# Local probes and scratch files
+.agent_probe*
+.tmp_*
+*.tmp
+*.bak
+*.log
+startup_error.txt

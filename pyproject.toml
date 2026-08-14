@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=65"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "midi-to-mscz"
+version = "0.3.0"
+description = "Turn imperfect, stem-separated MIDI transcriptions into clean MuseScore scores."
+requires-python = ">=3.10"
+dependencies = [
+    "mido>=1.3,<2",
+]
+
+[project.scripts]
+midi-to-mscz = "midi_to_mscz.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+midi_to_mscz = ["web/*.html", "web/*.css", "web/*.js"]
