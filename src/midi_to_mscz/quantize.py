@@ -281,6 +281,147 @@ def _anchor_barline_rolls(
             group.quantized_onset = boundary
 
 
+def _promote_layered_barline_rolls(
+    groups: list[AttackGroup],
+    boundaries: Sequence[Fraction],
+) -> None:
+    """Recognise isolated pedal-roll layers that land on a downbeat.
+
+    The general arpeggio detector deliberately rejects a monotonic subset
+    when extra tones sound with its last pitch.  That protects ordinary runs,
+    but Song Master also emits real rolled chords as three successive attack
+    *layers*, where an intermediate or terminal layer is already a chord.  A
+    very narrow barline-only fallback can recover those without relaxing the
+    global detector.
+
+    Every accepted candidate is an isolated three-layer burst, spans at least
+    an octave, has strictly separated pitch ranges, and retains pedal overlap
+    through the target barline.  The complete terminal chord is included in
+    the arpeggio instead of being treated as an unrelated simultaneous tone.
+    """
+
+    by_stream: dict[tuple[int, str], list[AttackGroup]] = defaultdict(list)
+    for group in groups:
+        sources = {note.source_index for note in group.notes}
+        if len(sources) == 1:
+            by_stream[(next(iter(sources)), str(group.staff))].append(group)
+
+    consumed: set[int] = set()
+    promotions: list[AttackGroup] = []
+    terminal_tolerance = Fraction(1, 16)
+    minimum_layer_gap = Fraction(1, 10)
+    maximum_layer_gap = Fraction(1, 6)
+    isolation = Fraction(1, 4)
+
+    for (source, staff), stream in sorted(by_stream.items()):
+        stream.sort(key=lambda group: group.raw_anchor)
+        onsets = [group.raw_anchor for group in stream]
+        for boundary in boundaries[1:]:
+            terminal_index = bisect_right(
+                onsets, boundary + terminal_tolerance
+            ) - 1
+            if terminal_index < 2:
+                continue
+            layers = stream[terminal_index - 2 : terminal_index + 1]
+            if any(id(layer) in consumed or layer.kind != "binary" for layer in layers):
+                continue
+            if not (
+                layers[0].raw_anchor < boundary
+                and abs(layers[-1].raw_anchor - boundary) <= terminal_tolerance
+                and layers[-1].raw_anchor - layers[0].raw_anchor <= Fraction(3, 8)
+            ):
+                continue
+
+            gaps = [
+                right.raw_anchor - left.raw_anchor
+                for left, right in zip(layers, layers[1:])
+            ]
+            if any(
+                gap < minimum_layer_gap or gap > maximum_layer_gap
+                for gap in gaps
+            ):
+                continue
+            if terminal_index >= 3 and (
+                layers[0].raw_anchor - stream[terminal_index - 3].raw_anchor
+                < isolation
+            ):
+                continue
+            if terminal_index + 1 < len(stream) and (
+                stream[terminal_index + 1].raw_anchor - layers[-1].raw_anchor
+                < isolation
+            ):
+                continue
+
+            pitch_layers = [
+                sorted(note.pitch for note in layer.notes) for layer in layers
+            ]
+            if any(not pitches for pitches in pitch_layers):
+                continue
+            upwards = all(
+                max(left) < min(right)
+                for left, right in zip(pitch_layers, pitch_layers[1:])
+            )
+            downwards = all(
+                min(left) > max(right)
+                for left, right in zip(pitch_layers, pitch_layers[1:])
+            )
+            if not (upwards or downwards):
+                continue
+
+            notes = [note for layer in layers for note in layer.notes]
+            if (
+                len(notes) < 4
+                or not any(len(layer.notes) > 1 for layer in layers)
+                or max(note.pitch for note in notes)
+                - min(note.pitch for note in notes)
+                < 12
+            ):
+                continue
+            if any(note.end_beat <= boundary for note in notes):
+                continue
+            if any(
+                note.end_beat < right.raw_anchor + Fraction(1, 8)
+                for left, right in zip(layers, layers[1:])
+                for note in left.notes
+            ):
+                continue
+
+            serial = len(promotions)
+            group_id = f"barline-arp:{source}:{staff}:{serial}"
+            direction = "up" if upwards else "down"
+            for note in notes:
+                note.arpeggio_id = group_id
+                note.quantization_kind = "arpeggio"
+            promotions.append(
+                AttackGroup(
+                    group_id=group_id,
+                    staff=layers[0].staff,
+                    notes=sorted(notes, key=lambda note: (note.start_beat, note.pitch)),
+                    raw_anchor=_median_fraction(
+                        [layer.raw_anchor for layer in layers]
+                    ),
+                    quantized_onset=boundary,
+                    kind="arpeggio",
+                    arpeggio_direction=direction,  # type: ignore[arg-type]
+                    confidence=0.92,
+                )
+            )
+            consumed.update(id(layer) for layer in layers)
+
+    if not promotions:
+        return
+    groups[:] = [group for group in groups if id(group) not in consumed]
+    groups.extend(promotions)
+    groups.sort(
+        key=lambda group: (
+            str(group.staff),
+            min(note.source_index for note in group.notes),
+            group.raw_anchor,
+            str(group.group_id),
+        )
+    )
+
+
 def _rolled_chord_clusters(
     notes: list[NoteEvent],
     bpm: float,
@@ -359,8 +500,52 @@ def _rolled_chord_clusters(
     return clusters
 
 
+def _binary_attack_layers(
+    notes: Sequence[NoteEvent],
+    prefix: str = "atk",
+) -> list[AttackGroup]:
+    """Collapse detector jitter into source-local simultaneous attack layers."""
+
+    by_source_staff: dict[tuple[int, str], list[NoteEvent]] = defaultdict(list)
+    for note in notes:
+        by_source_staff[(note.source_index, str(note.staff))].append(note)
+    groups: list[AttackGroup] = []
+    serial = 0
+    chord_window = Fraction(1, 20)
+    for (source, _staff), source_notes in sorted(by_source_staff.items()):
+        ordered = sorted(source_notes, key=lambda note: (note.start_beat, note.pitch))
+        index = 0
+        while index < len(ordered):
+            first = ordered[index]
+            cluster = [first]
+            cursor = index + 1
+            while cursor < len(ordered):
+                candidate = ordered[cursor]
+                if candidate.start_beat - first.start_beat > chord_window:
+                    break
+                cluster.append(candidate)
+                cursor += 1
+            groups.append(
+                AttackGroup(
+                    group_id=f"{prefix}:{source}:{serial}",
+                    staff=first.staff,
+                    notes=cluster,
+                    raw_anchor=_median_fraction(
+                        [note.start_beat for note in cluster]
+                    ),
+                    kind="binary",
+                )
+            )
+            serial += 1
+            index = cursor
+    return groups
+
+
 def _build_attack_groups(
-    notes: list[NoteEvent], settings: ConversionSettings, bpm: float
+    notes: list[NoteEvent],
+    settings: ConversionSettings,
+    bpm: float,
+    measure_boundaries: Sequence[Fraction] = (),
 ) -> list[AttackGroup]:
     groups: list[AttackGroup] = []
     consumed: set[str | int] = set()
@@ -370,9 +555,27 @@ def _build_attack_groups(
 
     arpeggio_serial = 0
     if settings.detect_arpeggios:
+        # Run the highly constrained downbeat-layer detector first.  The
+        # general note-by-note detector may otherwise greedily accept only a
+        # monotonic subset and leave the terminal block chord behind,
+        # especially under strict sensitivity.
+        if measure_boundaries:
+            provisional_layers = _binary_attack_layers(notes, prefix="layer")
+            _promote_layered_barline_rolls(
+                provisional_layers, measure_boundaries
+            )
+            for group in provisional_layers:
+                if group.kind != "arpeggio":
+                    continue
+                groups.append(group)
+                consumed.update(note.note_id for note in group.notes)
+
         for source_notes in by_source_staff.values():
+            available_notes = [
+                note for note in source_notes if note.note_id not in consumed
+            ]
             for cluster, direction in _rolled_chord_clusters(
-                source_notes, bpm, settings.arpeggio_sensitivity
+                available_notes, bpm, settings.arpeggio_sensitivity
             ):
                 cluster_ids = {note.note_id for note in cluster}
                 if any(
@@ -380,7 +583,7 @@ def _build_attack_groups(
                     and cluster[0].start_beat - Fraction(1, 20)
                     <= note.start_beat
                     <= cluster[-1].start_beat + Fraction(1, 20)
-                    for note in source_notes
+                    for note in available_notes
                 ):
                     # A simultaneous extra chord tone means the monotonic
                     # subset is not a self-contained roll.  Reject the subset
@@ -409,37 +612,11 @@ def _build_attack_groups(
     # Near-simultaneous attacks become a chord *within one input MIDI only*.
     # The input file is the voice boundary: two stems that happen to attack on
     # the same tick must remain two independent MuseScore voices.
-    remaining_by_source_staff: dict[tuple[int, str], list[NoteEvent]] = defaultdict(list)
-    for note in notes:
-        if note.note_id not in consumed:
-            remaining_by_source_staff[(note.source_index, str(note.staff))].append(note)
-    serial = 0
-    chord_window = Fraction(1, 20)  # 0.05 beats after latency correction
-    for (source, _staff), source_notes in sorted(remaining_by_source_staff.items()):
-        ordered = sorted(source_notes, key=lambda note: (note.start_beat, note.pitch))
-        index = 0
-        while index < len(ordered):
-            first = ordered[index]
-            cluster = [first]
-            cursor = index + 1
-            while cursor < len(ordered):
-                candidate = ordered[cursor]
-                if candidate.start_beat - first.start_beat > chord_window:
-                    break
-                cluster.append(candidate)
-                cursor += 1
-            anchor = _median_fraction([note.start_beat for note in cluster])
-            groups.append(
-                AttackGroup(
-                    group_id=f"atk:{source}:{serial}",
-                    staff=first.staff,
-                    notes=cluster,
-                    raw_anchor=anchor,
-                    kind="binary",
-                )
-            )
-            serial += 1
-            index = cursor
+    groups.extend(
+        _binary_attack_layers(
+            [note for note in notes if note.note_id not in consumed]
+        )
+    )
     groups.sort(
         key=lambda group: (
             str(group.staff),
@@ -1279,10 +1456,12 @@ def normalize(
     signature = metadata.time_signature
     key = metadata.key_fifths
 
-    attack_groups = _build_attack_groups(notes, settings, bpm)
     measure_boundaries = _measure_boundaries(
         metadata,
         max((note.start_beat for note in notes), default=Fraction(0)),
+    )
+    attack_groups = _build_attack_groups(
+        notes, settings, bpm, measure_boundaries
     )
     _anchor_barline_rolls(attack_groups, measure_boundaries)
     unresolved_regions: list[tuple[Fraction, Fraction, str]] = []
