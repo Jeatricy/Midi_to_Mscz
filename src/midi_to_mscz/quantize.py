@@ -11,7 +11,7 @@ from __future__ import annotations
 import copy
 import math
 import statistics
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -194,6 +194,91 @@ def _choose_metadata(
             0,
         )
     return signature, int(key)
+
+
+def _measure_boundaries(
+    metadata: ScoreMetadata,
+    through: Fraction,
+) -> list[Fraction]:
+    """Build the exact score barline timeline used for rhythmic anchoring.
+
+    A modulo operation on the initial meter is insufficient: a pickup shifts
+    every later barline, and an explicit meter change may close the current
+    measure early.  This mirrors the measure construction contract used by
+    the MusicXML writer so quantisation and rendering agree about barlines.
+    """
+
+    changes = sorted(metadata.meter_changes, key=lambda change: change.beat)
+    if changes:
+        numerator, denominator = changes[0].signature
+    else:
+        numerator, denominator = metadata.time_signature
+    cursor = Fraction(0)
+    boundaries = [cursor]
+    change_index = 0
+
+    initial_capacity = Fraction(numerator * 4, denominator)
+    pickup = Fraction(metadata.pickup_beats)
+    # Keep this validation identical to ``musicxml._pickup_length``.  A
+    # pickup that is as long as (or longer than) a complete opening measure
+    # is not a pickup; treating it as one here would make quantisation and
+    # MusicXML disagree about every later barline.
+    if pickup < 0 or pickup >= initial_capacity:
+        pickup = Fraction(0)
+    if pickup > 0:
+        cursor = pickup
+        boundaries.append(cursor)
+
+    target = max(Fraction(0), through) + Fraction(numerator * 4, denominator)
+    while cursor <= target:
+        while change_index < len(changes) and changes[change_index].beat <= cursor:
+            numerator, denominator = changes[change_index].signature
+            change_index += 1
+        measure_end = cursor + Fraction(numerator * 4, denominator)
+        if change_index < len(changes):
+            next_change = Fraction(changes[change_index].beat)
+            if cursor < next_change < measure_end:
+                measure_end = next_change
+        if measure_end <= cursor:
+            raise ValueError("拍号变化产生了零长度小节。")
+        boundaries.append(measure_end)
+        cursor = measure_end
+    return boundaries
+
+
+def _anchor_barline_rolls(
+    groups: Sequence[AttackGroup],
+    boundaries: Sequence[Fraction],
+) -> None:
+    """Notate a roll performed just before a barline on the new downbeat.
+
+    Song Master often places the audible lead-in of a rolled chord slightly
+    before the intended attack.  Once a group has already passed the strict
+    monotonic/overlap arpeggio detector, an ending within one eighth of a beat
+    of a barline is stronger notation evidence than its attack median.  Raw
+    timing remains untouched for reporting and audio verification.
+    """
+
+    tolerance = Fraction(1, 8)
+    for group in groups:
+        if group.kind != "arpeggio" or not group.notes:
+            continue
+        first_attack = min(note.start_beat for note in group.notes)
+        last_attack = max(note.start_beat for note in group.notes)
+        index = bisect_left(boundaries, last_attack)
+        candidates = [
+            boundaries[candidate]
+            for candidate in (index - 1, index)
+            if 0 <= candidate < len(boundaries)
+        ]
+        if not candidates:
+            continue
+        boundary = min(candidates, key=lambda value: (abs(value - last_attack), value))
+        if (
+            first_attack < boundary
+            and abs(last_attack - boundary) <= tolerance
+        ):
+            group.quantized_onset = boundary
 
 
 def _rolled_chord_clusters(
@@ -391,6 +476,7 @@ def _tuplet_candidates(
     sensitivity: str,
     time_signature: tuple[int, int] = (4, 4),
     unresolved_regions: list[tuple[Fraction, Fraction, str]] | None = None,
+    measure_boundaries: Sequence[Fraction] | None = None,
 ) -> dict[tuple[str | int, int], _TupletMatch]:
     """Return complete, anchored common tuplets that beat a straight grid.
 
@@ -472,7 +558,16 @@ def _tuplet_candidates(
                 if actual in {2, 4} and normal == 3 and not compound_meter:
                     continue
                 group_end = anchor + span
-                if anchor // measure_beats != (group_end - Fraction(1, 1000000)) // measure_beats:
+                end_probe = group_end - Fraction(1, 1000000)
+                if measure_boundaries:
+                    anchor_measure = bisect_right(measure_boundaries, anchor) - 1
+                    end_measure = bisect_right(measure_boundaries, end_probe) - 1
+                    crosses_barline = anchor_measure != end_measure
+                else:
+                    crosses_barline = (
+                        anchor // measure_beats != end_probe // measure_beats
+                    )
+                if crosses_barline:
                     # A single MusicXML tuplet cannot safely straddle a barline;
                     # MuseScore rewrites it into unrelated fragments.  Leave
                     # such ambiguous input unfolded for manual review.
@@ -1185,6 +1280,11 @@ def normalize(
     key = metadata.key_fifths
 
     attack_groups = _build_attack_groups(notes, settings, bpm)
+    measure_boundaries = _measure_boundaries(
+        metadata,
+        max((note.start_beat for note in notes), default=Fraction(0)),
+    )
+    _anchor_barline_rolls(attack_groups, measure_boundaries)
     unresolved_regions: list[tuple[Fraction, Fraction, str]] = []
     initial_tuplet_map = (
         _tuplet_candidates(
@@ -1193,6 +1293,7 @@ def normalize(
             settings.triplet_sensitivity,
             signature,
             unresolved_regions,
+            measure_boundaries,
         )
         if settings.detect_triplets
         else {}
@@ -1250,6 +1351,8 @@ def normalize(
     review_onsets: set[Fraction] = set()
 
     def resolved_onset(candidate: AttackGroup, source: int) -> Fraction:
+        if candidate.quantized_onset is not None:
+            return candidate.quantized_onset
         key = (candidate.group_id, source)
         grace = grace_map.get(key)
         if grace:
@@ -1464,8 +1567,6 @@ def normalize(
             str,
             int,
             Fraction,
-            Fraction,
-            str | None,
             str | None,
             bool,
             int,
@@ -1479,8 +1580,6 @@ def normalize(
             str(chord.staff),
             chord.notes[0].source_index,
             chord.onset,
-            chord.duration,
-            chord.arpeggio_direction,
             str(chord.tuplet_id) if chord.tuplet_id else None,
             chord.grace,
             chord.grace_order,
@@ -1495,6 +1594,11 @@ def normalize(
             merged_by_attack[key_tuple] = chord
         else:
             existing.notes.extend(chord.notes)
+            # One MIDI is one voice: every non-grace event snapped to the same
+            # attack is a single notated chord even if one subset supplied the
+            # arpeggio evidence or carried a different raw note-off.  The
+            # timeline pass below gives the merged chord one common release at
+            # the next distinct attack.
             existing.duration = max(existing.duration, chord.duration)
             existing.arpeggio_direction = existing.arpeggio_direction or chord.arpeggio_direction
     chords = _deduplicate_chords(list(merged_by_attack.values()), report)
@@ -1611,15 +1715,9 @@ def normalize(
         if metadata_warning not in report.warnings:
             report.warnings.append(metadata_warning)
 
-    measure_beats = Fraction(signature[0] * 4, signature[1])
-
     def review_measure(onset: Fraction) -> int:
-        pickup = metadata.pickup_beats
-        if pickup > 0:
-            if onset < pickup:
-                return 1
-            return int((onset - pickup) // measure_beats) + 2
-        return int(onset // measure_beats) + 1
+        index = bisect_right(measure_boundaries, onset) - 1
+        return max(1, index + 1)
 
     if unresolved_regions:
         measures = sorted(
